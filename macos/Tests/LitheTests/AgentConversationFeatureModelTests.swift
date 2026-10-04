@@ -1,4 +1,5 @@
 import Foundation
+import Combine
 import LitheCoreContracts
 import Testing
 @testable import LitheAgentConversationModule
@@ -7,6 +8,135 @@ import Testing
 /// are delivered synchronously through `receive`, so no test waits on timers.
 @MainActor
 struct AgentConversationFeatureModelTests {
+    @Test
+    func responseStatusUsesObservedProgressAndPermissionInsteadOfElapsedTime() async throws {
+        try await withStatisticsFeature { feature, connection, clock in
+            try feature.send("Create a sample")
+            try feature.receive(event("sessionCreated", ["token": connection.commands.last?["token"] as Any]))
+            #expect(feature.selectedConversation?.responseStatus == .waiting)
+            clock.advance(540)
+            #expect(feature.selectedConversation?.responseStatus == .waiting, "Silence cannot prove reasoning or retries")
+            try feature.receive(event("agentThoughtChunk"))
+            #expect(feature.selectedConversation?.responseStatus == .thinking)
+            try feature.receive(event("agentMessageChunk"))
+            #expect(feature.selectedConversation?.responseStatus == .responding)
+            try feature.receive(event("toolCall"))
+            #expect(feature.selectedConversation?.responseStatus == .runningTools)
+            try feature.receive(event("permission"))
+            #expect(feature.selectedConversation?.responseStatus == .waitingForPermission)
+            feature.answerPermission(optionID: "allow_once")
+            #expect(feature.selectedConversation?.responseStatus == .runningTools)
+            try feature.receive(event("toolCallUpdate"))
+            #expect(feature.selectedConversation?.responseStatus == .waiting)
+            try feature.receive(event("turnFinished"))
+            #expect(feature.selectedConversation?.responseStatus == nil)
+            #expect(feature.selectedConversation?.completedTurns.last?.duration == 540)
+            try feature.send("Continue")
+            #expect(feature.selectedConversation?.responseStatus == .waiting)
+        }
+    }
+
+    @Test
+    func titlelessRetryMetadataKeepsTheTurnBusyAndProgressClearsIt() async throws {
+        try await withStatisticsFeature { feature, connection, _ in
+            try feature.send("Try the service")
+            try feature.receive(event("sessionCreated", ["token": connection.commands.last?["token"] as Any]))
+            let title = feature.sessions.first?.title
+            let turn = feature.selectedConversation?.activeTurn
+            try feature.receive(event("codexRetry"))
+            #expect(feature.selectedConversation?.responseStatus == .retrying)
+            #expect(feature.selectedConversation?.activeTurn == turn)
+            #expect(feature.selectedConversation?.isResponding == true)
+            #expect(feature.selectedConversation?.errorMessage == nil)
+            #expect(feature.sessions.first?.title == title)
+            #expect(throws: AgentConversationError.sessionBusy) { try feature.send("Overlap") }
+            try feature.receive(event("agentThoughtChunk"))
+            #expect(feature.selectedConversation?.responseStatus == .thinking)
+            try feature.receive(event("codexRetry"))
+            try feature.receive(event("agentMessageChunk"))
+            #expect(feature.selectedConversation?.responseStatus == .responding)
+            try feature.receive(event("turnFinished"))
+            #expect(feature.selectedConversation?.responseStatus == nil)
+            try feature.receive(event("codexRetry"))
+            #expect(feature.selectedConversation?.responseStatus == nil, "Late retries must not resurrect a finished turn")
+            try feature.send("Next turn")
+            try feature.receive(event("codexRetry"))
+            #expect(feature.selectedConversation?.responseStatus == .waiting, "The previous upstream turn must stay retired")
+            try feature.receive(event("codexRetry", ["update": retryUpdate(turnID: "upstream-turn-2")]))
+            #expect(feature.selectedConversation?.responseStatus == .retrying)
+            try feature.receive(event("toolCall"))
+            #expect(feature.selectedConversation?.responseStatus == .runningTools)
+            try feature.receive(event("requestFailed"))
+            #expect(feature.selectedConversation?.responseStatus == nil)
+        }
+    }
+
+    @Test
+    func retryAndStoppingStatusAreIsolatedBySessionAndConnectionLifecycle() async throws {
+        try await withStatisticsFeature { feature, connection, _ in
+            try feature.send("First session")
+            try feature.receive(event("sessionCreated", ["token": connection.commands.last?["token"] as Any]))
+            try feature.receive(event("codexRetry"))
+            feature.startNewConversation()
+            try feature.send("Second session")
+            try feature.receive(event("sessionCreated", ["token": connection.commands.last?["token"] as Any, "sessionId": "session-2"]))
+            #expect(feature.selectedConversation?.responseStatus == .waiting)
+            #expect(feature.conversations["session-1"]?.responseStatus == .retrying)
+            feature.cancel()
+            try feature.receive(event("codexRetry", ["sessionId": "session-2", "update": retryUpdate(turnID: "second-turn")]))
+            try feature.receive(event("agentThoughtChunk", ["sessionId": "session-2"]))
+            #expect(feature.selectedConversation?.responseStatus == .stopping)
+            #expect(feature.conversations["session-1"]?.responseStatus == .retrying)
+            try feature.receive(event("turnCancelled", ["sessionId": "session-2"]))
+            #expect(feature.selectedConversation?.responseStatus == nil)
+            feature.selectSession("session-1")
+            #expect(feature.selectedConversation?.responseStatus == .retrying)
+            try feature.receive(event("stopped"))
+            #expect(feature.conversations.values.allSatisfy { $0.responseStatus == nil })
+        }
+    }
+
+    @Test
+    func invalidRetryMetadataAndHistoricalToolsCannotInventActivity() async throws {
+        try await withStatisticsFeature { feature, connection, _ in
+            try feature.send("Wait for the service")
+            try feature.receive(event("sessionCreated", ["token": connection.commands.last?["token"] as Any]))
+            for error in [["willRetry": false, "turnId": "turn"] as [String: Any],
+                          ["willRetry": "true", "turnId": "turn"],
+                          ["willRetry": true], ["willRetry": true, "turnId": ""]] {
+                try feature.receive(event("sessionInfo", ["update": ["sessionUpdate": "session_info_update",
+                    "_meta": ["codex": ["error": error]]]]))
+                #expect(feature.selectedConversation?.responseStatus == .waiting)
+            }
+        }
+        var history = AgentConversation()
+        history.messages = [AgentConversationMessage(id: "old-tool", role: .tool, text: "Historical", toolStatus: .inProgress),
+                            AgentConversationMessage(id: "new-turn", role: .user, text: "Continue")]
+        history.activeTurn = AgentTurnStatistics(id: "new-turn", startedAt: .now)
+        history.isResponding = true
+        #expect(history.responseStatus == .waiting)
+    }
+
+    @Test
+    func repeatedOutputChunksKeepConversationPublicationCoalesced() async throws {
+        try await withStatisticsFeature { feature, connection, _ in
+            try feature.send("Stream a response")
+            try feature.receive(event("sessionCreated", ["token": connection.commands.last?["token"] as Any]))
+            var publications = 0
+            let subscription = feature.$conversations.sink { _ in publications += 1 }
+            defer { subscription.cancel() }
+            let initial = publications
+            // Deliver one synchronous burst, before the owned flush task runs.
+            for _ in 0..<100 { try feature.receive(event("agentMessageChunk")) }
+            #expect(feature.selectedConversation?.responseStatus == .responding)
+            #expect(publications - initial == 1, "A text burst must publish its phase once, keeping transcript buffering intact")
+        }
+    }
+
+    private func retryUpdate(turnID: String) -> [String: Any] {
+        ["sessionUpdate": "session_info_update", "_meta": ["codex": ["error": ["willRetry": true, "turnId": turnID]]]]
+    }
+
     @Test
     func turnStatisticsIncludePreparationFreezeAtCompletionAndKeepReportedUsage() async throws {
         try await withStatisticsFeature { feature, connection, clock in
@@ -649,6 +779,76 @@ struct AgentConversationFeatureModelTests {
     }
 
     @Test
+    func fileReviewBaselinesSurviveReconnectAndHistoryReplay() async throws {
+        try await withReconnectableFeature { feature, transport in
+            feature.selectSession("session-1")
+            try feature.receive(event("sessionLoaded", ["token": transport.connections[0].commands.last?["token"] as Any]))
+            try receiveEdit(feature, id: "first", old: "A", new: "B")
+            let first = try #require(reviewActivity(feature).files.first)
+            feature.keepFileChanges([first], in: "session-1")
+
+            await feature.stop()
+            try feature.connect(configuration: configuration)
+            try feature.receive(event("ready"))
+            feature.prepareConversation()
+            let load = try #require(transport.connections[1].commands.last)
+            #expect(load["kind"] as? String == "loadSession")
+            try receiveEdit(feature, id: "first", old: "A", new: "B")
+            try feature.receive(event("sessionLoaded", ["token": load["token"] as Any]))
+            #expect(reviewActivity(feature).files.isEmpty)
+
+            try receiveEdit(feature, id: "later", old: "B", new: "C")
+            let later = reviewActivity(feature).files
+            var restoredText: String?
+            await feature.restoreFileChanges(later, in: "session-1") { change in
+                restoredText = change.diffs.first?.oldText
+            }
+            #expect(restoredText == "B", "Rollback must preserve the edit kept before reconnect")
+            #expect(reviewActivity(feature).files.isEmpty)
+
+            await feature.stop()
+            try feature.connect(configuration: configuration)
+            try feature.receive(event("ready"))
+            feature.prepareConversation()
+            let replayToken = transport.connections[2].commands.last?["token"] as Any
+            try receiveEdit(feature, id: "first", old: "A", new: "B")
+            try receiveEdit(feature, id: "later", old: "B", new: "C")
+            try feature.receive(event("sessionLoaded", ["token": replayToken]))
+            #expect(reviewActivity(feature).files.isEmpty, "Successfully rolled-back versions must stay acknowledged")
+
+            feature.closeConversation("session-1")
+            feature.selectSession("session-1")
+            let reopenedToken = transport.connections[2].commands.last?["token"] as Any
+            try receiveEdit(feature, id: "first", old: "A", new: "B")
+            try feature.receive(event("sessionLoaded", ["token": reopenedToken]))
+            #expect(reviewActivity(feature).files.count == 1, "Closing the tab releases its local review baseline")
+        }
+    }
+
+    @Test
+    func replayedChangedEvidenceIsNotHiddenByTheRetainedReviewBaseline() async throws {
+        try await withReconnectableFeature { feature, transport in
+            feature.selectSession("session-1")
+            try feature.receive(event("sessionLoaded", ["token": transport.connections[0].commands.last?["token"] as Any]))
+            try receiveEdit(feature, id: "first", old: "A", new: "B")
+            feature.keepFileChanges(reviewActivity(feature).files, in: "session-1")
+            await feature.stop()
+            try feature.connect(configuration: configuration)
+            try feature.receive(event("ready"))
+            feature.prepareConversation()
+            let failedLoad = transport.connections[1].commands.last?["token"] as Any
+            try receiveEdit(feature, id: "first", old: "A", new: "partial replay")
+            try feature.receive(event("requestFailed", ["token": failedLoad, "message": "Replay failed"]))
+            #expect(reviewActivity(feature).files.isEmpty, "A failed replay restores the acknowledged transcript")
+            feature.prepareConversation()
+            let load = transport.connections[1].commands.last?["token"] as Any
+            try receiveEdit(feature, id: "first", old: "A", new: "different")
+            try feature.receive(event("sessionLoaded", ["token": load]))
+            #expect(reviewActivity(feature).files.first?.diffs.first?.newText == "different")
+        }
+    }
+
+    @Test
     func providerReconnectRecreatesUnpromptedSessionsAndKeepsHistoryTabs() async throws {
         try await withReconnectableFeature { feature, transport in
             feature.selectSession("session-2")
@@ -1071,6 +1271,17 @@ struct AgentConversationFeatureModelTests {
         #expect(feature.connectionState == .connecting)
         try feature.receive(event("ready"))
         return (feature, transport.connections[0])
+    }
+
+    private func reviewActivity(_ feature: AgentConnectionModel) -> AgentActivity {
+        let conversation = feature.selectedConversation ?? AgentConversation()
+        return AgentActivity(messages: conversation.messages, reviewed: conversation.reviewedFileChanges)
+    }
+
+    private func receiveEdit(_ feature: AgentConnectionModel, id: String, old: String, new: String) throws {
+        let update: [String: Any] = ["sessionUpdate": "tool_call", "toolCallId": id, "kind": "edit",
+            "status": "completed", "content": [["type": "diff", "path": "a.txt", "oldText": old, "newText": new]]]
+        try feature.receive(event("toolCall", ["update": update]))
     }
 
     private func withReconnectableFeature(

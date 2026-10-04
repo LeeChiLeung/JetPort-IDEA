@@ -3,7 +3,8 @@ import LitheAgentConversationModule
 
 private enum AgentSelectorLayout {
     static let choiceRowHeight: CGFloat = 26
-    static let modeRowHeight: CGFloat = 44
+    // Leave one point of slack for AppKit's fractional pixel rounding.
+    static let modeRowHeight: CGFloat = 50
     static let modeViewportHeight: CGFloat = 320
     static let modeVerticalPadding: CGFloat = 5
 }
@@ -61,6 +62,7 @@ struct AgentSessionSelectors: View {
     let options: [AgentSessionConfigOption]
     let agentName: String?
     let isDisabled: Bool
+    var appliesToNextTurn = false
     let onSelect: (String, String) -> Void
     @State private var showsModels = false
     @State private var showsModes = false
@@ -84,11 +86,11 @@ struct AgentSessionSelectors: View {
                     }
                 }
                 .buttonStyle(.litheNoPress)
-                .help(AgentSessionSelectorPresentation.localized(mode.name))
+                .help(appliesToNextTurn ? String(localized: "Changes apply to the next turn.") : AgentSessionSelectorPresentation.localized(mode.name))
                 .accessibilityLabel(Text("Approval mode"))
                 .accessibilityValue(AgentSessionSelectorPresentation.currentTitle(mode))
                 .accessibilityIdentifier("agent-session-mode-selector")
-                .popover(isPresented: $showsModes, arrowEdge: .top) {
+                .litheDropdown(isPresented: $showsModes, opensUpward: true) {
                     AgentModePopover(option: mode) { value in select(mode.id, value) }
                         .onExitCommand { showsModes = false }
                 }
@@ -101,24 +103,33 @@ struct AgentSessionSelectors: View {
                     }
                 }
                 .buttonStyle(.litheNoPress)
-                .help(model.currentLabel)
+                .help(appliesToNextTurn ? String(localized: "Changes apply to the next turn.") : model.currentLabel)
                 .accessibilityLabel(Text("Model"))
                 .accessibilityValue(model.currentLabel)
                 .accessibilityIdentifier("agent-session-model-selector")
-                .popover(isPresented: $showsModels, arrowEdge: .top) {
+                .litheDropdown(isPresented: $showsModels, opensUpward: true) {
                     AgentModelPopover(option: model, settings: settings, agentName: agentName, onSelect: select)
                         .onExitCommand { showsModels = false }
                 }
             } else if !settings.isEmpty {
-                Menu {
-                    ForEach(settings) { option in
-                        Menu(AgentSessionSelectorPresentation.title(option)) {
-                            AgentConfigChoices(option: option) { select(option.id, $0) }
+                LitheMenu {
+                    for option in settings {
+                        LitheContextMenuItem.submenu(AgentSessionSelectorPresentation.title(option)) {
+                            for choice in option.choices {
+                                let title = AgentSessionSelectorPresentation.choiceTitle(choice, in: option)
+                                LitheContextMenuItem.action(
+                                    choice.group.map { "\($0): \(title)" } ?? title,
+                                    checked: choice.id == option.currentValue
+                                ) {
+                                    select(option.id, choice.id)
+                                }
+                            }
                         }
                     }
-                } label: { Image(systemName: "ellipsis") }
-                .menuStyle(.borderlessButton)
-                .menuIndicator(.hidden)
+                } label: {
+                    Image(systemName: "ellipsis")
+                }
+                .buttonStyle(.litheNoPress)
                 .fixedSize()
                 .help("More session settings")
             }
@@ -137,10 +148,10 @@ struct AgentSessionSelectors: View {
     private func selectorLabel<Content: View>(@ViewBuilder content: () -> Content) -> some View {
         HStack(spacing: 5) {
             content()
-            Image(systemName: "chevron.up").font(.system(size: 8, weight: .semibold))
+            Image(systemName: "chevron.up").font(LitheTheme.uiFont(size: 8, weight: .semibold))
         }
-        .font(.system(size: 11))
-        .foregroundStyle(AgentPanelStyle.secondary)
+        .font(LitheTheme.uiFont(size: 11))
+        .foregroundStyle(LitheTheme.secondaryText)
         .lineLimit(1)
         .truncationMode(.middle)
         .padding(.horizontal, 4)
@@ -174,7 +185,7 @@ struct AgentModelPopover: View {
             if let setting = settings.first(where: { $0.id == selectedSettingID }) {
                 VStack(spacing: 0) {
                     Text(AgentSessionSelectorPresentation.title(setting))
-                        .font(.system(size: 11)).foregroundStyle(AgentPanelStyle.secondary)
+                        .font(LitheTheme.uiFont(size: 11)).foregroundStyle(LitheTheme.secondaryText)
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .padding(.horizontal, 12).padding(.vertical, 8)
                     ScrollView {
@@ -193,8 +204,8 @@ struct AgentModelPopover: View {
                 .overlay(alignment: .leading) { Divider() }
             }
         }
-        .foregroundStyle(AgentPanelStyle.text)
-        .background(AgentPanelStyle.header)
+        .foregroundStyle(LitheTheme.primaryText)
+        .background(LitheTheme.settingsPopupBackground)
         .onAppear { searchFocused = true }
     }
 
@@ -202,7 +213,7 @@ struct AgentModelPopover: View {
         VStack(spacing: 0) {
             TextField("Search models", text: $query)
                 .textFieldStyle(.plain)
-                .font(.system(size: 12))
+                .font(LitheTheme.uiFont(size: 12))
                 .focused($searchFocused)
                 .padding(.horizontal, 8)
                 .frame(height: 28)
@@ -212,15 +223,15 @@ struct AgentModelPopover: View {
                 .onSubmit { if let choice = choices.first { onSelect(option.id, choice.id) } }
             if choices.isEmpty {
                 Text("No matching models")
-                    .font(.system(size: 12))
-                    .foregroundStyle(AgentPanelStyle.secondary)
+                    .font(LitheTheme.uiFont(size: 12))
+                    .foregroundStyle(LitheTheme.secondaryText)
                     .frame(maxWidth: .infinity, minHeight: 36)
             } else {
                 ScrollView {
                     LazyVStack(spacing: 0) {
                         ForEach(Array(choices.enumerated()), id: \.element.id) { index, choice in
                             if let group = choice.group, index == 0 || choices[index - 1].group != group {
-                                Text(group).font(.system(size: 10)).foregroundStyle(AgentPanelStyle.secondary)
+                                Text(group).font(LitheTheme.uiFont(size: 10)).foregroundStyle(LitheTheme.secondaryText)
                                     .frame(maxWidth: .infinity, alignment: .leading)
                                     .padding(.horizontal, 12).padding(.vertical, 4)
                             }
@@ -247,7 +258,7 @@ struct AgentModelPopover: View {
     }
 }
 
-/// Child choices stay inside the same native popover, so opening them cannot dismiss the model panel.
+/// Child choices stay inside the same shared dropdown, so opening them cannot dismiss the model panel.
 private struct AgentModelSettingRow: View {
     let option: AgentSessionConfigOption
     let isSelected: Bool
@@ -258,17 +269,13 @@ private struct AgentModelSettingRow: View {
             HStack {
                 Text(AgentSessionSelectorPresentation.title(option))
                 Spacer()
-                Text(AgentSessionSelectorPresentation.currentTitle(option)).foregroundStyle(AgentPanelStyle.secondary)
-                Image(systemName: "chevron.right").font(.system(size: 9))
+                Text(AgentSessionSelectorPresentation.currentTitle(option)).foregroundStyle(LitheTheme.secondaryText)
+                Image(systemName: "chevron.right").font(LitheTheme.uiFont(size: 9))
             }
-            .font(.system(size: 12))
-            .padding(.horizontal, 12)
-            .frame(height: 28)
-            .background(isSelected ? AgentPanelStyle.context : .clear)
+            .frame(minHeight: LitheDropdownMetrics.rowHeight)
             .contentShape(Rectangle())
-            .litheRowHover()
         }
-        .buttonStyle(.litheNoPress)
+        .buttonStyle(LitheDropdownRowStyle(isSelected: isSelected))
         .lithePointer()
     }
 }
@@ -288,8 +295,8 @@ struct AgentModePopover: View {
                             Text(AgentSessionSelectorPresentation.choiceTitle(choice, in: option)).lineLimit(1)
                             if let description = choice.description, !description.isEmpty {
                                 Text(AgentSessionSelectorPresentation.localized(description))
-                                    .font(.system(size: 11))
-                                    .foregroundStyle(AgentPanelStyle.secondary)
+                                    .font(LitheTheme.uiFont(size: 11))
+                                    .foregroundStyle(LitheTheme.secondaryText)
                                     .lineLimit(2)
                                     .fixedSize(horizontal: false, vertical: true)
                             }
@@ -311,8 +318,8 @@ struct AgentModePopover: View {
         .padding(.vertical, AgentSelectorLayout.modeVerticalPadding)
         .frame(width: 350, height: min(AgentSelectorLayout.modeViewportHeight,
                                      max(CGFloat(option.choices.count) * AgentSelectorLayout.modeRowHeight, contentHeight))
-               + 2 * AgentSelectorLayout.modeVerticalPadding)
-        .background(AgentPanelStyle.header)
+                + 2 * AgentSelectorLayout.modeVerticalPadding)
+        .background(LitheTheme.settingsPopupBackground)
     }
 }
 
@@ -323,10 +330,9 @@ private struct AgentModeContentHeightKey: PreferenceKey {
 
 private struct AgentSelectorRow<Content: View>: View {
     let isSelected: Bool
-    var minimumHeight: CGFloat = AgentSelectorLayout.choiceRowHeight
+    var minimumHeight: CGFloat = LitheDropdownMetrics.rowHeight
     let action: () -> Void
     @ViewBuilder let content: Content
-    @State private var isHovering = false
 
     var body: some View {
         Button(action: action) {
@@ -334,8 +340,8 @@ private struct AgentSelectorRow<Content: View>: View {
                 content
                 Spacer(minLength: 8)
                 Image(systemName: "checkmark")
-                    .font(.system(size: 11, weight: .semibold))
-                    .foregroundStyle(LitheTheme.success)
+                    .font(LitheTheme.uiFont(size: 11, weight: .semibold))
+                    .foregroundStyle(LitheTheme.accent)
                     .opacity(isSelected ? 1 : 0)
             }
             .font(.system(size: 12))
@@ -343,30 +349,10 @@ private struct AgentSelectorRow<Content: View>: View {
             .padding(.horizontal, 12)
             .padding(.vertical, 4)
             .frame(maxWidth: .infinity, minHeight: minimumHeight, alignment: .leading)
-            .background(isSelected ? AgentPanelStyle.selected : (isHovering ? AgentPanelStyle.context : .clear))
             .contentShape(Rectangle())
         }
-        .buttonStyle(.litheNoPress)
+        .buttonStyle(LitheDropdownRowStyle(isSelected: isSelected))
         .lithePointer()
-        .onHover { isHovering = $0 }
         .accessibilityAddTraits(isSelected ? .isSelected : [])
-    }
-}
-
-private struct AgentConfigChoices: View {
-    let option: AgentSessionConfigOption
-    let onSelect: (String) -> Void
-
-    var body: some View {
-        ForEach(option.choices) { choice in
-            Button { onSelect(choice.id) } label: {
-                let title = AgentSessionSelectorPresentation.choiceTitle(choice, in: option)
-                if choice.id == option.currentValue {
-                    Label(title, systemImage: "checkmark")
-                } else {
-                    Text(choice.group.map { "\($0): \(title)" } ?? title)
-                }
-            }
-        }
     }
 }

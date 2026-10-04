@@ -26,7 +26,8 @@ struct AgentConversationView: View {
                     onConnect: { model.connectAgentConversation() },
                     onOpenSettings: { showsSettings = true },
                     onCopySessionID: { model.copyAgentSessionID($0) },
-                    onOpenFile: { model.openAgentFile($0) }
+                    onOpenFile: { model.openAgentFile($0) },
+                    onRestoreFile: { try await model.restoreAgentFile($0) }
                 )
             } else {
                 AgentUnconfiguredConversationView(
@@ -51,6 +52,7 @@ struct AgentConfiguredConversationView: View {
     let onOpenSettings: () -> Void
     let onCopySessionID: (String) -> Void
     let onOpenFile: (AgentToolDetails.Location) -> Void
+    var onRestoreFile: (AgentFileChange) async throws -> Void = { _ in throw AgentEditRestoreError.unavailable }
 
     var body: some View {
         if let connection = feature.selectedConnection, let agentID = feature.selectedAgentID {
@@ -63,7 +65,8 @@ struct AgentConfiguredConversationView: View {
                 onConnect: onConnect,
                 onOpenSettings: onOpenSettings,
                 onCopySessionID: onCopySessionID,
-                onOpenFile: onOpenFile
+                onOpenFile: onOpenFile,
+                onRestoreFile: onRestoreFile
             )
             .id(agentID)
         } else {
@@ -81,7 +84,7 @@ private struct AgentPanelHeader<Actions: View>: View {
     var body: some View {
         HStack(spacing: 2) {
             Text(title)
-                .font(.system(size: 13, weight: .semibold))
+                .font(LitheTheme.uiFont(size: 13, weight: .semibold))
                 .foregroundStyle(AgentPanelStyle.text)
                 .lineLimit(1)
             Spacer(minLength: 12)
@@ -146,6 +149,7 @@ private struct AgentConnectionView: View {
     let onOpenSettings: () -> Void
     let onCopySessionID: (String) -> Void
     let onOpenFile: (AgentToolDetails.Location) -> Void
+    let onRestoreFile: (AgentFileChange) async throws -> Void
     @State private var localError: String?
     @State private var showsSearch = false
     @State private var searchText = ""
@@ -258,7 +262,7 @@ private struct AgentConnectionView: View {
                     onSelectAgent: onSelectAgent,
                     onOpenSettings: onOpenSettings,
                     onError: { localError = $0 },
-                    configOptions: feature.selectedConversation?.configOptions ?? [],
+                    configOptions: feature.selectedConversation?.displayConfigOptions ?? [],
                     sessionID: feature.selectedSessionID,
                     isPreparingSession: isPreparingSession,
                     isConfiguring: feature.selectedConversation?.pendingConfigToken != nil,
@@ -322,7 +326,8 @@ private struct AgentConnectionView: View {
                 AgentTranscriptView(
                     feature: feature, agentName: selectedAgent?.name ?? feature.agentName,
                     agentVersion: feature.agentVersion, agents: agents,
-                    onSelectAgent: onSelectAgent, searchText: searchText, onOpenFile: onOpenFile
+                    onSelectAgent: onSelectAgent, searchText: searchText, onOpenFile: onOpenFile,
+                    onRestoreFile: onRestoreFile
                 )
                 AgentInlineNotice(text: message)
                 Button("Reconnect", action: onConnect).padding(.bottom, 8)
@@ -345,7 +350,8 @@ private struct AgentConnectionView: View {
                 agents: agents,
                 onSelectAgent: onSelectAgent,
                 searchText: searchText,
-                onOpenFile: onOpenFile
+                onOpenFile: onOpenFile,
+                onRestoreFile: onRestoreFile
             )
         }
     }
@@ -407,7 +413,7 @@ struct AgentSessionTabStrip: View {
             }
             Button(action: onNew) {
                 Image(systemName: "plus")
-                    .font(.system(size: 11, weight: .semibold))
+                    .font(LitheTheme.uiFont(size: 11, weight: .semibold))
             }
             .litheIconButton()
             .help("New conversation")
@@ -436,13 +442,13 @@ private struct AgentSessionTab: View {
                 Circle().fill(LitheTheme.warning).frame(width: 6, height: 6)
             }
             Text(title)
-                .font(.system(size: 12, weight: isSelected ? .medium : .regular))
+                .font(LitheTheme.uiFont(size: 12, weight: isSelected ? .medium : .regular))
                 .lineLimit(1)
                 .frame(maxWidth: 140)
             if let close, isHovering || isSelected {
                 Button(action: close) {
                     Image(systemName: "xmark")
-                        .font(.system(size: 9, weight: .bold))
+                        .font(LitheTheme.uiFont(size: 9, weight: .bold))
                         .frame(width: 14, height: 14)
                 }
                 .buttonStyle(.litheNoPress)
@@ -481,14 +487,14 @@ struct AgentEmptyStateView: View {
                 ProgressView().controlSize(.regular)
             } else {
                 Image(systemName: systemImage)
-                    .font(.system(size: 28, weight: .light))
+                    .font(LitheTheme.uiFont(size: 28, weight: .light))
                     .foregroundStyle(LitheTheme.tertiaryText)
             }
             Text(title)
-                .font(.system(size: 13, weight: .semibold))
+                .font(LitheTheme.uiFont(size: 13, weight: .semibold))
                 .foregroundStyle(LitheTheme.primaryText)
             Text(message)
-                .font(.system(size: 12))
+                .font(LitheTheme.uiFont(size: 12))
                 .foregroundStyle(LitheTheme.secondaryText)
                 .multilineTextAlignment(.center)
                 .textSelection(.enabled)
@@ -526,7 +532,7 @@ struct AgentInlineNotice: View {
                     .buttonStyle(LitheSecondaryButtonStyle(horizontalPadding: 10, height: 24, fontSize: 11.5))
             }
         }
-        .font(.system(size: 12))
+        .font(LitheTheme.uiFont(size: 12))
         .foregroundStyle(LitheTheme.primaryText)
         .padding(10)
         .background(LitheTheme.warning.opacity(0.12), in: RoundedRectangle(cornerRadius: 8))

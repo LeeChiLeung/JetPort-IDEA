@@ -36,27 +36,35 @@ enum AgentTurnStatisticsPresentation {
 }
 
 /// Only the visible waiting row ticks; it never republishes the conversation.
-struct AgentThinkingRow: View {
-    var isCancelling = false
+struct AgentResponseStatusRow: View {
+    var responseStatus: AgentResponseStatus = .waiting
     var startedAt: ContinuousClock.Instant?
     var hasStreamingThought = false
 
     var status: String {
-        if isCancelling { return String(localized: "Stopping…") }
-        return hasStreamingThought ? String(localized: "Responding…") : String(localized: "Thinking…")
+        switch responseStatus {
+        case .preparing: String(localized: "Preparing conversation…")
+        case .waiting: String(localized: "Waiting for Agent response…")
+        case .thinking: String(localized: hasStreamingThought ? "Responding…" : "Thinking…")
+        case .responding: String(localized: "Responding…")
+        case .runningTools: String(localized: "Running tools…")
+        case .waitingForPermission: String(localized: "Waiting for permission…")
+        case .retrying: String(localized: "Agent is retrying…")
+        case .stopping: String(localized: "Stopping…")
+        }
     }
 
     var body: some View {
         TimelineView(.periodic(from: .now, by: 1)) { _ in
             HStack(spacing: 8) {
                 ProgressView().controlSize(.small)
-                Text(status)
+                Text(status).accessibilityIdentifier("agent-response-status")
                 if let startedAt {
                     let elapsed = AgentTurnStatistics(id: "waiting", startedAt: startedAt).elapsed(at: .now)
                     Text(AgentTurnStatisticsPresentation.duration(elapsed)).monospacedDigit()
                 }
             }
-            .font(.system(size: 12))
+            .font(LitheTheme.uiFont(size: 12))
             .foregroundStyle(LitheTheme.secondaryText)
             .padding(.leading, 2)
             .help("Elapsed since sending, including tools and permission waits.")
@@ -80,7 +88,7 @@ struct AgentTurnStatisticsView: View {
                 if let usage = statistics.usage { tokens(usage) }
             }
         }
-        .font(.system(size: 11))
+        .font(LitheTheme.uiFont(size: 11))
         .foregroundStyle(AgentPanelStyle.secondary)
         .monospacedDigit()
         .frame(maxWidth: .infinity, alignment: .leading)

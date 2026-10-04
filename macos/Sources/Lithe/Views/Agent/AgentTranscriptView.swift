@@ -75,6 +75,7 @@ struct AgentTranscriptView: View {
     let onSelectAgent: (String) -> Void
     var searchText = ""
     var onOpenFile: (AgentToolDetails.Location) -> Void = { _ in }
+    var onRestoreFile: (AgentFileChange) async throws -> Void = { _ in throw AgentEditRestoreError.unavailable }
     @State private var showsAgentPicker = false
     // A filtered-out row can be destroyed. Keep its preference in the owning
     // transcript view, isolated by session and message, until the actual data goes away.
@@ -82,18 +83,19 @@ struct AgentTranscriptView: View {
 
     var body: some View {
         let conversation = feature.selectedConversation
+        let sessionID = feature.selectedSessionID
         let messages = conversation?.messages ?? []
         let transcript = AgentTranscriptItem.grouped(messages, turns: conversation?.completedTurns ?? [])
             .filter { $0.matches(searchText) }
         // Only reasoning that is still streaming opens by default.
-        let liveThoughtID = conversation?.isResponding == true && messages.last?.role == .thought
+        let liveThoughtID = conversation?.responseStatus == .thinking && messages.last?.role == .thought
             ? messages.last?.id : nil
         VStack(spacing: 0) {
             if conversation?.isLoading != true && messages.isEmpty && feature.pendingNewConversationPrompt == nil {
                 AgentHeroView(agentName: agentName, agentVersion: agentVersion) {
                     showsAgentPicker = true
                 }
-                .popover(isPresented: $showsAgentPicker, arrowEdge: .bottom) {
+                .litheDropdown(isPresented: $showsAgentPicker) {
                     VStack(alignment: .leading, spacing: 2) {
                         ForEach(agents) { agent in
                             Button {
@@ -105,15 +107,13 @@ struct AgentTranscriptView: View {
                                     Spacer()
                                     if agent.name == agentName { Image(systemName: "checkmark") }
                                 }
-                                .padding(.horizontal, 10)
-                                .frame(height: 26)
+                                .frame(minHeight: LitheDropdownMetrics.rowHeight)
                                 .contentShape(Rectangle())
                             }
-                            .buttonStyle(.litheNoPress)
-                            .litheRowHover()
+                            .buttonStyle(LitheDropdownRowStyle(isSelected: agent.name == agentName))
                         }
                     }
-                    .padding(6)
+                    .padding(LitheDropdownMetrics.popupPadding)
                     .frame(width: 180)
                 }
             } else {
@@ -154,8 +154,8 @@ struct AgentTranscriptView: View {
                                     .id("pending")
                             }
                             if conversation?.isResponding == true || feature.isCreatingSession {
-                                AgentThinkingRow(
-                                    isCancelling: conversation?.isCancelling == true,
+                                AgentResponseStatusRow(
+                                    responseStatus: conversation?.responseStatus ?? .preparing,
                                     startedAt: conversation?.activeTurn?.startedAt ?? feature.pendingNewConversationStartedAt,
                                     hasStreamingThought: liveThoughtID != nil
                                 ).id("responding")
@@ -182,11 +182,23 @@ struct AgentTranscriptView: View {
             if let permission = conversation?.permission {
                 AgentPermissionCard(permission: permission, answer: { feature.answerPermission(optionID: $0) }, onOpenFile: onOpenFile)
             }
-            if let plan = conversation?.plan {
-                AgentPlanView(plan: plan, isResponding: conversation?.isResponding == true)
-                    .id(feature.selectedSessionID)
-            }
-            AgentActivitySummaryBar(messages: messages)
+            AgentActivitySummaryBar(
+                messages: messages, plan: conversation?.plan,
+                reviewed: conversation?.reviewedFileChanges ?? [:],
+                isResponding: conversation?.isResponding == true,
+                isReviewing: feature.fileReviewSessionID != nil,
+                reviewError: feature.fileReviewErrorSessionID == sessionID ? feature.fileReviewError : nil,
+                onOpenFile: onOpenFile,
+                onKeep: { changes in
+                    if let sessionID { feature.keepFileChanges(changes, in: sessionID) }
+                },
+                onRestore: { changes in
+                    if let sessionID {
+                        await feature.restoreFileChanges(changes, in: sessionID, restore: onRestoreFile)
+                    }
+                }
+            )
+            .id(feature.selectedSessionID)
         }
         .onChange(of: feature.openSessionIDs) { sessionIDs in
             thoughtExpansions = thoughtExpansions.filter { sessionIDs.contains($0.key) }
@@ -228,7 +240,7 @@ struct AgentHeroView: View {
             .overlay(alignment: .topLeading) {
                 if let agentVersion, !agentVersion.isEmpty {
                     Text("v\(agentVersion)")
-                        .font(.system(size: 10, weight: .medium))
+                        .font(LitheTheme.uiFont(size: 10, weight: .medium))
                         .padding(.horizontal, 8)
                         .padding(.vertical, 2)
                         .foregroundStyle(AgentPanelStyle.versionText)
@@ -240,57 +252,11 @@ struct AgentHeroView: View {
             }
             Text(agentName.map { String(format: String(localized: "Send a message to %@"), $0) }
                  ?? String(localized: "Choose an Agent to start"))
-                .font(.system(size: 14))
+                .font(LitheTheme.uiFont(size: 14))
                 .foregroundStyle(AgentPanelStyle.logo)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .help("Switch Agent")
-    }
-}
-
-/// Three segments below the transcript: tool tasks, running, edits. Kept
-/// visible even when empty so the layout does not jump when the first tool
-/// call arrives. Edits count tool calls the agent titled as file changes.
-struct AgentActivitySummaryBar: View {
-    let messages: [AgentConversationMessage]
-
-    private var tools: [AgentConversationMessage] { messages.filter { $0.role == .tool } }
-    private var running: Int { tools.filter { $0.toolStatus == .inProgress || $0.toolStatus == .pending }.count }
-    private var failed: Int { tools.filter { $0.toolStatus == .failed }.count }
-    private var edits: Int {
-        tools.filter { message in
-            message.toolDetails.kind == "edit" || message.toolDetails.kind == "delete"
-        }.count
-    }
-
-    var body: some View {
-        HStack(spacing: 0) {
-            segment(systemImage: "checklist", title: "Tasks", value: tools.count, tint: failed > 0 ? LitheTheme.error : nil)
-            Divider().frame(height: 14).overlay(LitheTheme.divider)
-            segment(systemImage: "arrow.triangle.2.circlepath", title: "Running", value: running, tint: running > 0 ? LitheTheme.accent : nil)
-            Divider().frame(height: 14).overlay(LitheTheme.divider)
-            segment(systemImage: "pencil", title: "Edits", value: edits, tint: nil)
-        }
-        .font(.system(size: 11))
-        .foregroundStyle(AgentPanelStyle.muted)
-        .frame(height: 32)
-        .background(AgentPanelStyle.header, in: RoundedRectangle(cornerRadius: 5))
-        .overlay(RoundedRectangle(cornerRadius: 5).stroke(AgentPanelStyle.border, lineWidth: 1))
-        .padding(.horizontal, 18)
-        .padding(.bottom, 4)
-    }
-
-    private func segment(systemImage: String, title: LocalizedStringKey, value: Int, tint: Color?) -> some View {
-        HStack(spacing: 5) {
-            Image(systemName: systemImage).font(.system(size: 10))
-            Text(title)
-            if value > 0 {
-                Text("\(value)")
-                    .font(.system(size: 10, weight: .semibold, design: .monospaced))
-                    .foregroundStyle(tint ?? LitheTheme.primaryText)
-            }
-        }
-        .frame(maxWidth: .infinity)
     }
 }
 
@@ -305,10 +271,10 @@ private struct AgentPermissionCard: View {
                 Image(systemName: "hand.raised.fill")
                     .foregroundStyle(LitheTheme.warning)
                 Text("Permission required")
-                    .font(.system(size: 12.5, weight: .semibold))
+                    .font(LitheTheme.uiFont(size: 12.5, weight: .semibold))
             }
             Text(permission.title)
-                .font(.system(size: 12, design: .monospaced))
+                .font(LitheTheme.uiFont(size: 12, design: .monospaced))
                 .foregroundStyle(LitheTheme.primaryText)
                 .textSelection(.enabled)
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -355,7 +321,7 @@ private struct AgentMessageRow: View {
             HStack {
                 Spacer(minLength: 40)
                 Text(message.text)
-                    .font(.system(size: 13))
+                    .font(LitheTheme.uiFont(size: 13))
                     .textSelection(.enabled)
                     .padding(.horizontal, 12)
                     .padding(.vertical, 8)
@@ -386,7 +352,7 @@ struct AgentToolEvidenceView: View {
                         .truncationMode(.middle)
                 }
                     .buttonStyle(.litheNoPress)
-                    .font(.system(size: 11, design: .monospaced))
+                    .font(LitheTheme.uiFont(size: 11, design: .monospaced))
                     .help(location.path)
             }
             if let input = details.input { evidence("Input", text: input) }
@@ -400,10 +366,10 @@ struct AgentToolEvidenceView: View {
 
     private func evidence(_ title: String, text: String) -> some View {
         VStack(alignment: .leading, spacing: 4) {
-            Text(title).font(.system(size: 11, weight: .medium)).foregroundStyle(LitheTheme.secondaryText)
+            Text(title).font(LitheTheme.uiFont(size: 11, weight: .medium)).foregroundStyle(LitheTheme.secondaryText)
             ScrollView([.horizontal, .vertical]) {
                 Text(text)
-                    .font(.system(size: 11, design: .monospaced))
+                    .font(LitheTheme.uiFont(size: 11, design: .monospaced))
                     .textSelection(.enabled)
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
@@ -423,7 +389,7 @@ private struct AgentMarkdownMessage: View {
                 switch segment {
                 case .prose(let prose):
                     Text(Self.markdown(prose))
-                        .font(.system(size: 13))
+                        .font(LitheTheme.uiFont(size: 13))
                         .textSelection(.enabled)
                         .frame(maxWidth: .infinity, alignment: .leading)
                 case .code(let language, let code):
@@ -488,7 +454,7 @@ private struct AgentCodeBlock: View {
         VStack(alignment: .leading, spacing: 0) {
             HStack {
                 Text(language.isEmpty ? String(localized: "code") : language)
-                    .font(.system(size: 10.5, weight: .medium))
+                    .font(LitheTheme.uiFont(size: 10.5, weight: .medium))
                     .foregroundStyle(LitheTheme.tertiaryText)
                 Spacer()
                 Button {
@@ -498,7 +464,7 @@ private struct AgentCodeBlock: View {
                     Task { try? await Task.sleep(for: .seconds(1.5)); didCopy = false }
                 } label: {
                     Image(systemName: didCopy ? "checkmark" : "doc.on.doc")
-                        .font(.system(size: 10.5))
+                        .font(LitheTheme.uiFont(size: 10.5))
                 }
                 .buttonStyle(.litheNoPress)
                 .lithePointer()

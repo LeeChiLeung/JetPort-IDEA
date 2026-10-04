@@ -37,6 +37,10 @@ public final class AgentConnectionModel: ObservableObject {
     @Published public private(set) var isRefreshingSessions = false
     @Published public private(set) var historyError: String?
     @Published public private(set) var errorMessage: String?
+    @Published public private(set) var fileReviewSessionID: String?
+    @Published public private(set) var fileReviewError: String?
+    @Published public private(set) var fileReviewErrorSessionID: String?
+    private var fileReviewTask: Task<Void, Never>?
 
     /// Called when any conversation starts or stops waiting for a permission
     /// decision, so a background project can signal it.
@@ -123,6 +127,8 @@ public final class AgentConnectionModel: ObservableObject {
 
     /// Stop the agent and wait for its process tree to exit.
     public func stop() async {
+        fileReviewTask?.cancel()
+        if let fileReviewTask { await fileReviewTask.value }
         let old = detachConnection(failure: nil)
         await old?.close()
         if let closeTask { await closeTask.value }
@@ -219,10 +225,17 @@ public final class AgentConnectionModel: ObservableObject {
 
     public func setConfigOption(_ id: String, value: String) {
         guard let sessionID = selectedSessionID, let conversation = conversations[sessionID],
-              conversation.isAttached, !conversation.isResponding, !conversation.isLoading,
+              conversation.isAttached, !conversation.isLoading,
               conversation.pendingConfigToken == nil,
               let option = conversation.configOptions.first(where: { $0.id == id }),
-              option.choices.contains(where: { $0.id == value }), option.currentValue != value else { return }
+              option.choices.contains(where: { $0.id == value }) else { return }
+        if conversation.isResponding {
+            // Do not change the running turn's model or its outstanding tool permissions.
+            conversations[sessionID]?.queuedConfigValues[id] = option.currentValue == value ? nil : value
+            conversations[sessionID]?.configurationError = nil
+            return
+        }
+        guard option.currentValue != value else { return }
         let token = makeToken()
         conversations[sessionID]?.pendingConfigToken = token
         conversations[sessionID]?.configurationError = nil
@@ -261,6 +274,7 @@ public final class AgentConnectionModel: ObservableObject {
     }
 
     public func send(_ text: String, files: [AgentFileReference] = []) throws {
+        guard fileReviewSessionID == nil else { throw AgentConversationError.fileReviewInProgress }
         let prompt = AgentPrompt(
             text: text.trimmingCharacters(in: .whitespacesAndNewlines),
             files: try AgentFileReference.adding(files.map(\.url), to: []),
@@ -278,7 +292,9 @@ public final class AgentConnectionModel: ObservableObject {
         }
         let conversation = conversations[sessionID] ?? AgentConversation()
         guard !conversation.isResponding else { throw AgentConversationError.sessionBusy }
-        guard conversation.pendingConfigToken == nil else { throw AgentConversationError.configurationPending }
+        guard conversation.pendingConfigToken == nil, conversation.queuedConfigValues.isEmpty else {
+            throw AgentConversationError.configurationPending
+        }
         if conversation.isLoading {
             queuedPrompts[sessionID] = prompt
         } else if conversation.isAttached {
@@ -376,9 +392,20 @@ public final class AgentConnectionModel: ObservableObject {
                 startPrompt(prompt, in: sessionID)
             }
         case "sessionConfigured":
-            guard let sessionID, conversations[sessionID]?.pendingConfigToken == token else { return }
+            guard let sessionID, let token, conversations[sessionID]?.pendingConfigToken == token else { return }
             applyConfiguration(event["configOptions"], to: sessionID)
             conversations[sessionID]?.pendingConfigToken = nil
+            if let id = conversations[sessionID]?.pendingQueuedConfigID {
+                let requested = conversations[sessionID]?.queuedConfigValues[id]
+                let confirmed = conversations[sessionID]?.configOptions.first { $0.id == id }?.currentValue
+                conversations[sessionID]?.pendingQueuedConfigID = nil
+                guard requested == confirmed else {
+                    failQueuedConfiguration(in: sessionID, message: String(localized: "The Agent did not confirm the selected session setting."))
+                    return
+                }
+                conversations[sessionID]?.queuedConfigValues[id] = nil
+                applyQueuedConfiguration(in: sessionID)
+            }
         case "turnCancelling":
             guard let sessionID else { return }
             conversations[sessionID]?.isCancelling = true
@@ -394,6 +421,7 @@ public final class AgentConnectionModel: ObservableObject {
                   let requestID = event["requestId"] as? String,
                   let request = event["request"] as? [String: Any] else { return }
             let prompt = permissionPrompt(requestID, request, sessionID: sessionID)
+            markResponseProgress(.waiting, in: sessionID)
             conversations[sessionID, default: AgentConversation()].enqueuePermission(prompt)
             updateAttention()
         case "turnFinished":
@@ -407,6 +435,7 @@ public final class AgentConnectionModel: ObservableObject {
             conversations[sessionID]?.pendingPermissions.removeAll()
             conversations[sessionID]?.errorMessage = stopReasonMessage(event["stopReason"] as? String)
             updateAttention()
+            applyQueuedConfiguration(in: sessionID)
         case "requestFailed":
             requestFailed(token: token, sessionID: sessionID, message: event["message"] as? String ?? String(localized: "The Agent request failed."))
         case "stopped":
@@ -447,7 +476,7 @@ public final class AgentConnectionModel: ObservableObject {
             historyError = message
         } else if let sessionID, let token, conversations[sessionID]?.pendingConfigToken == token {
             conversations[sessionID]?.pendingConfigToken = nil
-            conversations[sessionID]?.configurationError = message
+            failQueuedConfiguration(in: sessionID, message: message)
         } else if let token, token == createToken {
             queuedPrompts.removeValue(forKey: token)
             createToken = nil
@@ -471,6 +500,7 @@ public final class AgentConnectionModel: ObservableObject {
             conversations[sessionID]?.pendingPermissions.removeAll()
             conversations[sessionID]?.errorMessage = message
             updateAttention()
+            applyQueuedConfiguration(in: sessionID)
         } else {
             errorMessage = message
         }
@@ -502,9 +532,11 @@ public final class AgentConnectionModel: ObservableObject {
             applyConfiguration(update["configOptions"], to: sessionID)
         case "agent_message_chunk":
             guard let text = Self.text(of: update) else { return }
+            if !text.isEmpty { markResponseProgress(.responding, in: sessionID) }
             buffer(text, role: .agent, in: sessionID)
         case "agent_thought_chunk":
             guard let text = Self.text(of: update) else { return }
+            if !text.isEmpty { markResponseProgress(.thinking, in: sessionID) }
             buffer(text, role: .thought, in: sessionID)
         case "plan":
             guard let plan = AgentPlan.parse(update) else { return }
@@ -528,7 +560,21 @@ public final class AgentConnectionModel: ObservableObject {
             guard let toolCallID = update["toolCallId"] as? String else { return }
             flushPendingText()
             upsertTool(toolCallID, update: update, in: sessionID)
+            markResponseProgress(.waiting, in: sessionID)
         case "session_info_update":
+            // codex-acp 1.13.1 forwards retries in metadata without a title.
+            // Consume the explicit flag, never infer retries from a silent timer
+            // or show raw provider errors that may contain private routing data.
+            if conversations[sessionID]?.isResponding == true,
+               conversations[sessionID]?.isCancelling != true,
+               let metadata = update["_meta"] as? [String: Any],
+               let codex = metadata["codex"] as? [String: Any],
+               let error = codex["error"] as? [String: Any], error["willRetry"] as? Bool == true,
+               let turnID = error["turnId"] as? String, !turnID.isEmpty,
+               turnID != conversations[sessionID]?.previousRetryTurnID {
+                conversations[sessionID]?.retryTurnID = turnID
+                conversations[sessionID]?.responsePhase = .retrying
+            }
             guard let title = update["title"] as? String, !title.isEmpty else { return }
             if let index = sessions.firstIndex(where: { $0.id == sessionID }) {
                 sessions[index].title = title
@@ -540,6 +586,14 @@ public final class AgentConnectionModel: ObservableObject {
         }
     }
 
+    private func markResponseProgress(_ status: AgentResponseStatus, in sessionID: String) {
+        guard conversations[sessionID]?.isResponding == true,
+              conversations[sessionID]?.isCancelling != true,
+              conversations[sessionID]?.responsePhase != status else { return }
+        // Keep text-chunk publication coalesced; only phase transitions publish.
+        conversations[sessionID]?.responsePhase = status
+    }
+
     private func applyConfiguration(_ value: Any?, to sessionID: String) {
         let options = AgentSessionConfigOption.parse(value)
         let oldModels = conversations[sessionID]?.configOptions.filter { $0.category == "model" } ?? []
@@ -548,6 +602,46 @@ public final class AgentConnectionModel: ObservableObject {
             conversations[sessionID]?.contextUsage = nil
         }
         conversations[sessionID, default: AgentConversation()].configOptions = options
+    }
+
+    /// Submit next-turn choices only after the Host has released this session's prompt.
+    private func applyQueuedConfiguration(in sessionID: String) {
+        guard let conversation = conversations[sessionID], conversation.isAttached,
+              !conversation.isResponding, !conversation.isLoading,
+              conversation.pendingConfigToken == nil, !conversation.queuedConfigValues.isEmpty else { return }
+        // A model acknowledgement can replace the available reasoning/speed choices.
+        // Revalidate each remaining choice against that latest complete option list.
+        let ordered = conversation.configOptions.filter { $0.category == "model" }
+            + conversation.configOptions.filter { $0.category != "model" }
+        for option in ordered {
+            guard let value = conversations[sessionID]?.queuedConfigValues[option.id] else { continue }
+            if option.currentValue == value {
+                conversations[sessionID]?.queuedConfigValues[option.id] = nil
+                continue
+            }
+            guard option.choices.contains(where: { $0.id == value }) else {
+                failQueuedConfiguration(in: sessionID, message: String(localized: "The Agent no longer supports the selected session setting."))
+                return
+            }
+            let token = makeToken()
+            conversations[sessionID]?.pendingConfigToken = token
+            conversations[sessionID]?.pendingQueuedConfigID = option.id
+            if !sendCommand(["kind": "setConfigOption", "token": token, "sessionId": sessionID,
+                             "configId": option.id, "value": value]) {
+                conversations[sessionID]?.pendingConfigToken = nil
+                failQueuedConfiguration(in: sessionID, message: errorMessage ?? AgentConversationError.notConnected.localizedDescription)
+            }
+            return
+        }
+        if conversations[sessionID]?.queuedConfigValues.isEmpty == false {
+            failQueuedConfiguration(in: sessionID, message: String(localized: "The Agent no longer supports the selected session setting."))
+        }
+    }
+
+    private func failQueuedConfiguration(in sessionID: String, message: String) {
+        conversations[sessionID]?.queuedConfigValues.removeAll()
+        conversations[sessionID]?.pendingQueuedConfigID = nil
+        conversations[sessionID]?.configurationError = message
     }
 
     private func append(_ text: String, role: AgentConversationMessage.Role, to sessionID: String) {
@@ -615,6 +709,8 @@ public final class AgentConnectionModel: ObservableObject {
         conversation.messages.append(message)
         conversation.activeTurn = AgentTurnStatistics(id: message.id, startedAt: prompt.submittedAt)
         conversation.isResponding = true
+        conversation.responsePhase = .waiting
+        conversation.retryTurnID = nil
         conversation.errorMessage = nil
         conversations[sessionID] = conversation
         return true
@@ -627,6 +723,9 @@ public final class AgentConnectionModel: ObservableObject {
         pendingText[sessionID] = nil
         // The agent replays the whole history, so rebuild it from scratch.
         var conversation = AgentConversation()
+        // Review decisions belong to the open tab, not the connection. Replayed
+        // evidence still has to match the acknowledged version or exact prefix.
+        conversation.reviewedFileChanges = loadBackups[sessionID]?.reviewedFileChanges ?? [:]
         conversation.isLoading = true
         conversations[sessionID] = conversation
         if !sendCommand(["kind": "loadSession", "token": token, "sessionId": sessionID]) {
@@ -691,6 +790,8 @@ public final class AgentConnectionModel: ObservableObject {
             conversations[id]?.interruptPendingTools()
             conversations[id]?.isCancelling = false
             conversations[id]?.pendingConfigToken = nil
+            conversations[id]?.queuedConfigValues.removeAll()
+            conversations[id]?.pendingQueuedConfigID = nil
             conversations[id]?.isLoading = false
             conversations[id]?.isAttached = false
             conversations[id]?.pendingPermissions.removeAll()
@@ -785,6 +886,8 @@ public enum AgentConversationError: LocalizedError, Equatable {
     case cannotResume
     case configurationPending
     case sessionBusy
+    case fileReviewInProgress
+    case fileReviewChanged
     case sendFailed(String)
 
     public var errorDescription: String? {
@@ -799,8 +902,55 @@ public enum AgentConversationError: LocalizedError, Equatable {
         case .sessionStopping: String(localized: "The previous Agent is still stopping. Try again shortly.")
         case .cannotResume: String(localized: "This Agent cannot reopen earlier conversations. Start a new conversation.")
         case .sessionBusy: String(localized: "The Agent is still responding in this conversation.")
+        case .fileReviewInProgress: String(localized: "Wait for the Agent file rollback to finish.")
+        case .fileReviewChanged: String(localized: "The reported file changes have been updated. Review them again before rolling back.")
         case .sendFailed(let message): message
         case .configurationPending: String(localized: "Wait for the Agent configuration to finish updating.")
         }
+    }
+}
+
+extension AgentConnectionModel {
+    /// Files have already been saved by the Agent. Keeping an exact version
+    /// acknowledges its review without changing the transcript or editor buffers.
+    public func keepFileChanges(_ changes: [AgentFileChange], in sessionID: String) {
+        guard fileReviewSessionID == nil, let conversation = conversations[sessionID], !conversation.isResponding else { return }
+        let current = AgentActivity(messages: conversation.messages, reviewed: conversation.reviewedFileChanges).files
+        let complete = AgentActivity(messages: conversation.messages).files
+        for change in changes where !change.isPending && current.contains(change) {
+            conversations[sessionID]?.reviewedFileChanges[change.path] = complete.first { $0.path == change.path }
+        }
+    }
+
+    /// The connection owns the native restoration job and awaits it at shutdown.
+    /// A batch acknowledges each success; failed and newer versions stay visible.
+    public func restoreFileChanges(
+        _ changes: [AgentFileChange], in sessionID: String,
+        restore: @escaping @MainActor (AgentFileChange) async throws -> Void
+    ) async {
+        guard fileReviewSessionID == nil else { return }
+        fileReviewSessionID = sessionID
+        fileReviewError = nil
+        fileReviewErrorSessionID = sessionID
+        let job = Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                for change in changes {
+                    try Task.checkCancellation()
+                    guard let conversation = self.conversations[sessionID], !conversation.isResponding,
+                          change.canRevert, AgentActivity(messages: conversation.messages, reviewed: conversation.reviewedFileChanges).files.contains(change) else {
+                        throw AgentConversationError.fileReviewChanged
+                    }
+                    let snapshot = AgentActivity(messages: conversation.messages).files.first { $0.path == change.path }
+                    try await restore(change)
+                    self.conversations[sessionID]?.reviewedFileChanges[change.path] = snapshot
+                }
+            } catch is CancellationError { }
+            catch { self.fileReviewError = error.localizedDescription }
+        }
+        fileReviewTask = job
+        await withTaskCancellationHandler { await job.value } onCancel: { job.cancel() }
+        fileReviewTask = nil
+        fileReviewSessionID = nil
     }
 }

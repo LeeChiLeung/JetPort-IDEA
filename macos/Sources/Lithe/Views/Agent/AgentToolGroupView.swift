@@ -6,6 +6,7 @@ struct AgentToolGroupView: View {
     let messages: [AgentConversationMessage]
     let searchText: String
     let onOpenFile: (AgentToolDetails.Location) -> Void
+    var initiallyExpanded = false
 
     @State private var expanded = false
     @State private var expandedToolID: String?
@@ -25,13 +26,13 @@ struct AgentToolGroupView: View {
             Button { expanded.toggle() } label: {
                 HStack(spacing: 8) {
                     Text("Tool activity (\(messages.count))")
-                        .font(.system(size: 12, weight: .semibold))
+                        .font(LitheTheme.uiFont(size: 12, weight: .semibold))
                         .foregroundStyle(LitheTheme.primaryText)
                         .lineLimit(1)
                     Spacer(minLength: 4)
                     summary
                     Image(systemName: expanded ? "chevron.down" : "chevron.right")
-                        .font(.system(size: 10))
+                        .font(LitheTheme.uiFont(size: 10))
                         .foregroundStyle(LitheTheme.tertiaryText)
                 }
                 .padding(.horizontal, 10)
@@ -63,7 +64,7 @@ struct AgentToolGroupView: View {
             RoundedRectangle(cornerRadius: 6)
                 .stroke(failedCount > 0 ? LitheTheme.error.opacity(0.7) : LitheTheme.panelBorder, lineWidth: 1)
         )
-        .onAppear { if !searchText.isEmpty { expanded = true } }
+        .onAppear { if initiallyExpanded || !searchText.isEmpty { expanded = true } }
         .onChange(of: searchText) { _ in if !searchText.isEmpty { expanded = true } }
     }
 
@@ -103,7 +104,7 @@ struct AgentToolGroupView: View {
                     }
                     .frame(width: 16)
                     Text(message.text)
-                        .font(.system(size: 11, design: .monospaced))
+                        .font(LitheTheme.uiFont(size: 11, design: .monospaced))
                         .foregroundStyle(LitheTheme.primaryText)
                         .lineLimit(1)
                         .truncationMode(.middle)
